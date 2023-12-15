@@ -14,12 +14,12 @@ class Neuron:
         self.nin = nin
 
         if activation == 'relu':
-            self.init_strategy = self._he_init_strategy(nin)
+            self.init_strategy = self._he_init_strategy
         elif activation == 'sigm' or activation == 'tanh':
-            self.init_strategy = self._xavier_init_strategy(nin)
+            self.init_strategy = self._xavier_init_strategy
 
-        self.w = [Value(self.init_strategy()) for _ in range(nin)]
-        self.b = Value(self.init_strategy())
+        self.w = [Value(self.init_strategy(nin)) for _ in range(nin)]
+        self.b = Value(self.init_strategy(nin))
         self.activation = activation
 
     def __call__(self, x):
@@ -33,12 +33,12 @@ class Neuron:
             return output.sigmoid()
         elif self.activation == None:
             return output
-        
+
     def _he_init_strategy(self, input_size: int):
-        return lambda : np.random.normal(0, math.sqrt(2.0 / input_size))
+        return np.random.normal(0, math.sqrt(2.0 / input_size))
     
     def _xavier_init_strategy(self, input_size: int):
-        return lambda : np.random.uniform(-1.0 / math.sqrt(input_size), 1.0 / math.sqrt(input_size))
+        return np.random.uniform(-1.0 / math.sqrt(input_size), 1.0 / math.sqrt(input_size))
     
     def parameters(self):
         return self.w + [self.b]

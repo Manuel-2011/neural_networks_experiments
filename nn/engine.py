@@ -9,7 +9,10 @@ class Value:
     self._op = _op
     self.label = label
     self.grad = 0.0
-    self._backward = lambda: None
+    self._backward = self._default_backward
+
+  def _default_backward(self):
+    return None
 
   def __repr__(self):
     return f"Value(data={self.data})"
