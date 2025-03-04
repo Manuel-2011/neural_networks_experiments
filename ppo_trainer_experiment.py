@@ -8,7 +8,7 @@ import time
 start_time = time.time()
 
 logger = getLogger(__name__)
-logfile_name = 'ppo-mul7.log'
+logfile_name = 'ppo-mul16_change_ref_occasionaly_and_kl_early_stopping.log'
 if os.path.exists(logfile_name):
   os.remove(logfile_name)
 logging.basicConfig(filename=logfile_name, encoding='utf-8', level=logging.DEBUG)
@@ -81,7 +81,7 @@ def generate_batch_completion(model, tokenizer, prompts: list):
 import re
 
 def extract_answer(response, transform_fn = lambda x: x, nan_val = None)->str|None:
-    ans = re.search('<answer>(.+)</answer>', response)
+    ans = re.match('.*<answer>(.+)</answer>$', response, re.DOTALL)
     if ans:
         try:
             return transform_fn(ans[1])
@@ -107,6 +107,10 @@ def eval_multiplication(model, tokenizer, epochs=10, batch_size=128, generate_fn
         format_errors += (answer == None).sum()
         matches += (correct_result == answer).sum()
         tries += len(correct_result)
+
+        del responses
+        del answer
+        torch.cuda.empty_cache()
     
     acc = matches/tries
     format_errors /= tries
@@ -195,6 +199,7 @@ def get_rewards(samples, is_terminal, correct_result):
     answer = torch.tensor([extract_answer(response, lambda x: int(x) if x.isnumeric() else torch.nan, torch.nan) for response in samples])
 
     eos_index = (is_terminal == 0).sum(dim=1)
+    logger.info(f'Response length mean: {eos_index.to(torch.float16).mean():,.2f}')
     eos_index = torch.min(eos_index, torch.tensor(is_terminal.shape[1]-1))
 
     answer_is_correct = (answer == correct_result)
@@ -207,9 +212,9 @@ def get_rewards(samples, is_terminal, correct_result):
     logger.debug(f'Correct: {answer_is_correct_count}, Wrong_format: {wrong_format_count}, Wrong_anser: {answer_is_not_correct_count-wrong_format_count}')
 
     # 0.5 reward point if the response has an answer tag
-    rewards[torch.arange(len(samples)), eos_index] += (1-wrong_format.to(torch.float32))*0.5
+    rewards[torch.arange(len(samples)), eos_index] = (1-wrong_format.to(torch.float32))*0.5
     # An additional 1 point of reward if the answer is correct
-    rewards[torch.arange(len(samples)), eos_index] = answer_is_correct.to(torch.float32)
+    rewards[torch.arange(len(samples)), eos_index] += answer_is_correct.to(torch.float32)
     logger.debug(f'Rewards: {rewards[torch.arange(len(samples)), eos_index]}')
     return rewards
 
@@ -283,8 +288,7 @@ def compute_advantages(rewards, is_terminal, values, gamma=1.0, gae_lambda=0.2):
 # %%
 import numpy as np
 
-def update_critic(critic, optimizer, update_epochs, minibatch_size, returns, is_terminal, complete_prompts, prompt_length, old_values=None, scheduler=None):
-    value_clip = 0.2
+def update_critic(critic, optimizer, update_epochs, minibatch_size, returns, is_terminal, complete_prompts, prompt_length, old_values=None, scheduler=None, value_clip=0.2):
     for epoch in range(update_epochs):
         batch_indices = np.arange(len(returns))
         np.random.shuffle(batch_indices)
@@ -321,18 +325,19 @@ def update_critic(critic, optimizer, update_epochs, minibatch_size, returns, is_
             nn.utils.clip_grad_norm_(critic.parameters(), 0.1) # Avoid large gradients
             optimizer.step()
 
-    # Update the scheduler every epoch
+    # Update the scheduler every rl step no matter the epochs
     if scheduler:
         scheduler.step()
 
 # %%
-def update_policy(model, ref_model, optimizer, returns, is_terminal, advatanges, complete_prompts, prompt_length, generations, minibatch_size, update_epochs, scheduler=None):
-    lower_clipped_threshold = 0.4
-    upper_clipped_threshold = 3.0
-    # lower_clipped_threshold = 0.8 # Safer update if the ref model is updated at very rl step
-    # upper_clipped_threshold = 1.5 # Safer update if the ref model is updated at very rl step
+def update_policy(model, ref_model, optimizer, returns, is_terminal, advatanges, complete_prompts, prompt_length, generations, minibatch_size, update_epochs, scheduler=None, target_kl=None, normalize_advantage=False, policy_clip=0.2):
+    # lower_clipped_threshold = 0.4
+    # upper_clipped_threshold = 3.0
+    lower_clipped_threshold = 1-policy_clip # Safer update if the ref model is updated at very rl step
+    upper_clipped_threshold = 1+policy_clip # Safer update if the ref model is updated at very rl step
     entropy_clip = 35.
     entro_loss_weight = 0.
+
     for epoch in range(update_epochs):
         batch_indices = np.arange(len(returns))
         np.random.shuffle(batch_indices)
@@ -340,6 +345,9 @@ def update_policy(model, ref_model, optimizer, returns, is_terminal, advatanges,
         is_terminal = is_terminal.to(model.device)
         advatanges = advatanges.to(model.device)
         minibatches= len(returns) // minibatch_size
+        batch_size = len(batch_indices)
+
+        approx_kl = 0 # kl divergence for early stopping
 
         ## Iterate in minibatches (random minibatch_size responses)
         for start in range(0, len(returns), minibatch_size):
@@ -362,16 +370,24 @@ def update_policy(model, ref_model, optimizer, returns, is_terminal, advatanges,
             ref_probs_tokens = ref_probs[torch.arange(len(completion_ids)), completion_ids]
             log_ref_probs_sum = torch.log(ref_probs_tokens)
             # calculate the probability ratio as probs_policy_model/probs_ref_model
-            probability_ratio = (log_probs_sum - log_ref_probs_sum).exp()
+            log_prob_ratio = log_probs_sum - log_ref_probs_sum
+            probability_ratio = log_prob_ratio.exp()
 
             # terminal state is shift to the right so the eos token that has the reward is taken in account
             minibatch_is_not_terminal = torch.cat((torch.ones(actual_minibatch_size,1, device=critic.device), 1-is_terminal[start:end]), dim=1)[:,:returns.shape[1]]
             minibatch_is_not_terminal = minibatch_is_not_terminal.reshape(-1)
 
+            # Calculate KL divergence for early stopping
+            with torch.no_grad():
+                minibatch_approx_kl = ((((probability_ratio - 1) - log_prob_ratio) * minibatch_is_not_terminal).sum() /  minibatch_is_not_terminal.count_nonzero())
+                approx_kl += minibatch_approx_kl * actual_minibatch_size / batch_size
+            logger.debug(f'Approx KL divergence of minibatch: {minibatch_approx_kl:.6f}')
+
             minibatch_advantages = advatanges[minibatch_indices,:returns.shape[1]].reshape(-1) * minibatch_is_not_terminal
 
             # Normalize advantages
-            minibatch_advantages = (minibatch_advantages - minibatch_advantages.mean()) / (minibatch_advantages.std() + 1e-8)
+            if normalize_advantage:
+                minibatch_advantages = (minibatch_advantages - minibatch_advantages.mean()) / (minibatch_advantages.std() + 1e-8)
 
             # The policy loss is to maximize the probability_ratio times the advantages
             loss = probability_ratio * minibatch_advantages
@@ -400,7 +416,14 @@ def update_policy(model, ref_model, optimizer, returns, is_terminal, advatanges,
             nn.utils.clip_grad_norm_(model.parameters(), 0.1) # Avoid large gradients
             optimizer.step()
 
-    # Update the scheduler every epoch
+        # Early stopping based on KL divergence
+        logger.debug(f'Approx KL divergence of epoch {epoch+1}: {approx_kl:.6f}')
+        if target_kl is not None:
+            if approx_kl > target_kl:
+                logger.info(f'Breaking of policy update early on epoch {epoch+1} with approx. kl divergence: {approx_kl:.6f}')
+                break
+
+    # Update the scheduler every rl step no matter the epochs
     if scheduler:
         scheduler.step()
 
@@ -439,32 +462,61 @@ ref_model.eval()
 max_steps = 250*8
 sims_per_prompt = 8
 rl_steps = max_steps // sims_per_prompt
-minibatch_size = 4
+minibatch_size = 8
 update_epochs = 4
 
 model.train()
 critic.train()
 
 from torch.optim.lr_scheduler import LinearLR
-optimizer1 = torch.optim.Adam(critic.parameters(), lr=1e-7, betas=(0.9, 0.999))
-optimizer2 = torch.optim.Adam(model.parameters(), lr=5e-7, betas=(0.9, 0.999))
-scheduler1 = LinearLR(optimizer1, total_iters=25)
-scheduler2 = LinearLR(optimizer2, total_iters=25)
+policy_lr = 1e-7
+value_lr = 25e-7
+warmup_steps = 25
+optimizer1 = torch.optim.Adam(critic.parameters(), lr=value_lr, betas=(0.9, 0.999))
+optimizer2 = torch.optim.Adam(model.parameters(), lr=policy_lr, betas=(0.9, 0.999))
+scheduler1 = LinearLR(optimizer1, total_iters=warmup_steps)
+scheduler2 = LinearLR(optimizer2, total_iters=warmup_steps)
+update_ref_model_steps = 3
+gae_lambda = 0.5
+normalize_advantage=False
+target_kl=0.05
+value_clip=0.2
+policy_clip=0.2
+logger.info(f'Hyperparameters:\npolicy_lr:{policy_lr}\nvalue_lr:{value_lr}\nwarmup_steps:{warmup_steps}\ngae_lambda: {gae_lambda}\nnormalize advantage:{normalize_advantage}\ntarget_kl:{target_kl}\nvalue_clip:{value_clip}\npolicy_clip:{policy_clip}')
+
 
 import copy
 # Training loop
 try:
+    model.eval()
+    with torch.no_grad():
+        acc = eval_multiplication(model, tokenizer, epochs=40, batch_size=64)
+    logger.info(f'Evaluation before training: {acc}')
+    model.train()
+    
     for rl_step in range(rl_steps):
+        logger.info(f'rl_step: {rl_step+1:,}')
         generations, rewards, is_terminal, values, complete_prompts, prompt_length = run_one_mul_simulation(model, critic, sims_per_prompt)
-        advatanges, returns = compute_advantages(rewards, is_terminal, values.cpu())
+        advatanges, returns = compute_advantages(rewards, is_terminal, values.cpu(), gae_lambda=gae_lambda)
 
-        logger.debug(f'rl_step: {rl_step+1:,}')
+        logger.info('Updating critic')
         logger.debug(f'Learning rate: {scheduler1.get_lr()}')
-        logger.debug('Updating critic')
-        update_critic(critic, optimizer1, update_epochs, minibatch_size, returns, is_terminal, complete_prompts, prompt_length, old_values=values, scheduler=scheduler1)
-        logger.debug('Updating policy')
-        update_policy(model, ref_model, optimizer2, returns, is_terminal, advatanges, complete_prompts, prompt_length, generations, minibatch_size, update_epochs, scheduler=scheduler2)
-        # ref_model = copy.deepcopy(model) # Update the ref model at every iteration
+        update_critic(critic, optimizer1, update_epochs, minibatch_size, returns, is_terminal, complete_prompts, prompt_length, old_values=values, scheduler=scheduler1, value_clip=value_clip)
+        logger.info('Updating policy')
+        logger.debug(f'Learning rate: {scheduler2.get_lr()}')
+        update_policy(model, ref_model, optimizer2, returns, is_terminal, advatanges, complete_prompts, prompt_length, generations, minibatch_size, update_epochs, scheduler=scheduler2, target_kl=target_kl, normalize_advantage=normalize_advantage, policy_clip=policy_clip)
+
+        # Trach progress on specific task
+        if (rl_step+1)%10 == 0:
+            model.eval()
+            with torch.no_grad():
+                acc = eval_multiplication(model, tokenizer, epochs=20, batch_size=64)
+            logger.info(f'Evaluation on rl step {rl_step+1:,}: {acc}')
+            model.train()
+
+        if update_ref_model_steps is not None and (rl_step+1)%update_ref_model_steps == 0:
+            ref_model = copy.deepcopy(model).eval() # Update the ref model
+
 except KeyboardInterrupt:
     pass
 
@@ -473,7 +525,7 @@ critic.save_pretrained('critic_model')
 model.eval()
 with torch.no_grad():
     acc = eval_multiplication(model, tokenizer, epochs=40, batch_size=64)
-logger.debug(f'Evaluation: {acc}')
+logger.info(f'Evaluation after training: {acc}')
 
 
 end_time = time.time()
