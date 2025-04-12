@@ -8,7 +8,7 @@ import time
 start_time = time.time()
 
 logger = getLogger(__name__)
-logfile_name = 'grpo8.log'
+logfile_name = 'grpo-DrGrpo11.log'
 if os.path.exists(logfile_name):
   os.remove(logfile_name)
 logging.basicConfig(filename=logfile_name, encoding='utf-8', level=logging.DEBUG)
@@ -23,33 +23,6 @@ def get_policy_model():
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     return model, tokenizer
-
-# %%
-
-
-# %%
-def generate_completion(model, tokenizer, prompt):
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": prompt}
-    ]
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
-    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-
-    generated_ids = model.generate(
-        **model_inputs,
-        max_new_tokens=512
-    )
-    generated_ids = [
-        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-    ]
-
-    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    return response
 
 def generate_batch_completion(model, tokenizer, prompts: list):
     batch = [[
@@ -79,7 +52,6 @@ def generate_batch_completion(model, tokenizer, prompts: list):
     response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
     return response
 
-# %%
 import re
 
 def extract_answer(response, transform_fn = lambda x: x, nan_val = None)->str|None:
@@ -91,7 +63,6 @@ def extract_answer(response, transform_fn = lambda x: x, nan_val = None)->str|No
             return nan_val
     return nan_val
 
-# %%
 import numpy as np
 from tqdm import tqdm
 
@@ -124,12 +95,6 @@ def eval_multiplication(model, tokenizer, epochs=10, batch_size=128, generate_fn
     }
 
 
-# %% [markdown]
-# ## Create the critic model
-# 
-# The same Qwen 0.5B model but with a different head to output a single value that will represent the expected value (reward and future rewards) of a given sequence of tokens.
-
-# %%
 import torch
 from torch import nn
 
@@ -142,7 +107,6 @@ def make_rollouts(model, simulations, initial_prompt: str, max_size = 256, tempe
     
     prompt_length = input_tokens.shape[1]
     is_terminal = torch.zeros((simulations, max_size + prompt_length))
-    values = None
     # generate each response token in a batch and calculate the value for each of them
     for i in range(max_size):
         # TODO: Only calculate the response logits and values one and use those to do the optimization step
@@ -154,6 +118,7 @@ def make_rollouts(model, simulations, initial_prompt: str, max_size = 256, tempe
             # sample next action (next token)
             probs = torch.nn.functional.softmax(logits, dim=1)
             sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=1)
+            # topk=50
             indices = sorted_indices[:,:50]
             probs = sorted_probs[:,:50]
             probs = probs / probs.sum(dim=1, keepdim=True)
@@ -232,7 +197,7 @@ def run_one_mul_simulation(model, generations_num, temperature=1.0):
 
 
 # %%
-def compute_advantages(rewards, is_terminal, gamma=1.0, gae_lambda=0.2):
+def compute_advantages(rewards, is_terminal, gamma=1.0, gae_lambda=0.2, dr_grpo=False):
     # Find the longest response in the batch
     num_rollout_steps = torch.max((is_terminal==0).sum(1))
     num_rollout_steps = torch.min(num_rollout_steps, torch.tensor(rewards.shape[1])-1)
@@ -241,7 +206,9 @@ def compute_advantages(rewards, is_terminal, gamma=1.0, gae_lambda=0.2):
     eos_index = (is_terminal == 0).sum(dim=1)
     eos_index = torch.min(num_rollout_steps, eos_index)
     rewards_of_outputs = rewards[torch.arange(len(rewards)), eos_index]
-    norm_rewards = (rewards_of_outputs - rewards_of_outputs.mean()) / (rewards_of_outputs.std() + 1e-8)
+    norm_rewards = (rewards_of_outputs - rewards_of_outputs.mean()) 
+    if not dr_grpo:
+        norm_rewards /= (rewards_of_outputs.std() + 1e-8)
 
     for i in range(len(rewards)):
         advantages[i,:eos_index[i]+1] = norm_rewards[i]
@@ -254,13 +221,9 @@ import numpy as np
 
 
 # %%
-def update_policy(model, ref_model, old_model, optimizer, is_terminal, advantanges, complete_prompts, prompt_length, generations, minibatch_size, update_epochs, scheduler=None, normalize_advantage=False, lower_clip=None, upper_clip=None, kl_penalty_coef=0.04):
-    # lower_clipped_threshold = 0.4
-    # upper_clipped_threshold = 3.0
-    lower_clipped_threshold = lower_clip # Safer update if the ref model is updated at very rl step
-    upper_clipped_threshold = upper_clip # Safer update if the ref model is updated at very rl step
-    entropy_clip = 35.
-    entro_loss_weight = 0.
+def update_policy(model, ref_model, old_model, optimizer, is_terminal, advantanges, complete_prompts, prompt_length, generations, minibatch_size, update_epochs, scheduler=None, normalize_advantage=False, lower_clip=None, upper_clip=None, kl_penalty_coef=0.04, dr_grpo=False):
+    lower_clipped_threshold = lower_clip
+    upper_clipped_threshold = upper_clip
 
     for epoch in range(update_epochs):
         batch_indices = np.arange(len(advantanges))
@@ -274,16 +237,13 @@ def update_policy(model, ref_model, old_model, optimizer, is_terminal, advantang
         for start in range(0, len(advantanges), minibatch_size):
             end = start + minibatch_size
             minibatch_indices = batch_indices[start:end]
-            # Calculate the logits for the generated responses with the policy model
-            # logits = model(complete_prompts[minibatch_indices,:prompt_length+advantanges.shape[1]]).logits[:,prompt_length:]
+            # Calculate the logits for the generated responses with the policy model (the logits of the previous token represents the distribution of the current token, that's why the -1)
             logits = model(complete_prompts[minibatch_indices,:prompt_length+advantanges.shape[1]]).logits[:,prompt_length-1:-1]
             if old_model is not None:
                 with torch.no_grad():
-                    # old_logits  = old_model(complete_prompts[minibatch_indices,:prompt_length+advantanges.shape[1]]).logits[:,prompt_length:]
                     old_logits  = old_model(complete_prompts[minibatch_indices,:prompt_length+advantanges.shape[1]]).logits[:,prompt_length-1:-1]
             # Calculate the logits for the generated responses with the ref model
             with torch.no_grad():
-                # ref_logits  = ref_model(complete_prompts[minibatch_indices,:prompt_length+advantanges.shape[1]]).logits[:,prompt_length:]
                 ref_logits  = ref_model(complete_prompts[minibatch_indices,:prompt_length+advantanges.shape[1]]).logits[:,prompt_length-1:-1]
             # Get the ids of the actual generated tokens
             completion_ids = generations[minibatch_indices]
@@ -303,58 +263,49 @@ def update_policy(model, ref_model, old_model, optimizer, is_terminal, advantang
             ref_probs = nn.functional.softmax(ref_logits.reshape(actual_minibatch_size*max_tokens,-1), dim=1)
             ref_probs_tokens = ref_probs[torch.arange(len(completion_ids)), completion_ids]
             log_ref_probs_sum = torch.log(ref_probs_tokens).reshape(advantanges.shape)
-            # calculate the probability ratio as probs_policy_model/probs_ref_model
-            log_prob_ratio = log_probs_sum - log_ref_probs_sum
-            probability_ratio = log_prob_ratio.exp()
 
             # terminal state is shift to the right so the eos token that has the reward is taken in account
             minibatch_is_not_terminal = torch.cat((torch.ones(actual_minibatch_size,1, device=model.device), 1-is_terminal[minibatch_indices]), dim=1)[:,:advantanges.shape[1]]
-            #minibatch_is_not_terminal = minibatch_is_not_terminal[minibatch_indices]
 
-            # Calculate KL divergence for early stopping
+            # Track KL divergence
+            log_prob_ratio = log_probs_sum - log_ref_probs_sum
+            probability_ratio = log_prob_ratio.exp()
             minibatch_approx_kl = ((probability_ratio - 1) - log_prob_ratio) * minibatch_is_not_terminal
             minibatch_approx_kl_by_generation = (minibatch_approx_kl.sum(dim=1) / minibatch_is_not_terminal.count_nonzero(dim=1))
             minibatch_approx_kl_mean = minibatch_approx_kl_by_generation.mean()
-            # minibatch_approx_kl_mean = minibatch_approx_kl.sum() / minibatch_is_not_terminal.count_nonzero()
             logger.info(f'minibatch_approx_kl_by_generation: {minibatch_approx_kl_by_generation}')
             logger.debug(f'Approx KL divergence of minibatch: {minibatch_approx_kl_mean:.6f}')
 
             minibatch_advantages = advantanges[minibatch_indices,:advantanges.shape[1]] * minibatch_is_not_terminal
 
             # The policy loss is to maximize the probability_ratio times the advantages
-            # loss = probability_ratio * minibatch_advantages
             new_old_prob_ratio = (log_probs_sum-log_old_probs_sum).exp()
+            # Verification in case the old model is the same as the current one
             logger.debug(f'new_old_prob_ratio. This should be 1, {(new_old_prob_ratio*minibatch_is_not_terminal).sum()/minibatch_is_not_terminal.count_nonzero()}')
             loss = new_old_prob_ratio * minibatch_advantages
             logger.debug(f'probability ratio: mean - {probability_ratio.mean()}, min - {probability_ratio.min()}, max: {probability_ratio.max()}')
-            # Clipped loss: Only considers the probability_ration change between a reasonable range
+            # Clipped loss: Only considers the probability_ratio change between a reasonable range
             if lower_clipped_threshold != None and upper_clipped_threshold != None:
                 clipped_loss = torch.clamp(new_old_prob_ratio, lower_clipped_threshold, upper_clipped_threshold) * minibatch_advantages
             else:
                 clipped_loss = loss
 
-            # Print tokens to be prioritized and tokens to be deprioritized
-            # prioritized_tokens, priotized_indices = torch.sort(clipped_loss, dim=-1)
-            # logger.debug(f'prioritized_tokens: {prioritized_tokens.shape, prioritized_tokens[-3:]} {tokenizer.decode(completion_ids[priotized_indices][-3:])}')
-            # logger.debug(f'deprioritized_tokens: {prioritized_tokens.shape, prioritized_tokens[:3]} {tokenizer.decode(completion_ids[priotized_indices][:3])}')
-
-            # logger.debug(f'pre-loss:{loss}')
-            # logger.debug(f'clipped-loss:{clipped_loss}')
-            # logger.debug(f'minibatch_is_not_terminal: {minibatch_is_not_terminal}')
             logger.debug(f'generation_length: {minibatch_is_not_terminal.count_nonzero(dim=1)}')
-            loss_avg_by_generation = torch.min(loss, clipped_loss).sum(dim=1) / minibatch_is_not_terminal.count_nonzero(dim=1)
-            logger.debug(f'loss_avg_by_generation: {loss_avg_by_generation}')
-            loss_mean = loss_avg_by_generation.mean()
+            # Take the min to be pessimistic
+            if dr_grpo:
+                loss_mean = torch.min(loss, clipped_loss).sum(dim=1).mean()
+            else:
+                loss_avg_by_generation = torch.min(loss, clipped_loss).sum(dim=1) / minibatch_is_not_terminal.count_nonzero(dim=1)
+                logger.debug(f'loss_avg_by_generation: {loss_avg_by_generation}')
+                loss_mean = loss_avg_by_generation.mean()
             logger.debug(f'loss_mean: {loss_mean}')
-            # Be pessimistic in the loss calulation, and add the minus to perform optimization minimizing the loss
-            loss_with_kl_penalty = loss_mean - kl_penalty_coef*minibatch_approx_kl_mean
-            loss = -loss_with_kl_penalty
+            # Add the minus to perform optimization minimizing the loss
+            if dr_grpo:
+                loss = -loss_mean
+            else:
+                loss_with_kl_penalty = loss_mean - kl_penalty_coef*minibatch_approx_kl_mean
+                loss = -loss_with_kl_penalty
 
-            # Add entropy loss
-            # logits_distribution = torch.distributions.categorical.Categorical(probs=probs_tokens.reshape(-1, probs_tokens.size(-1)))
-            # ent = (logits_distribution.entropy().reshape(len(probs_tokens), -1) * minibatch_is_not_terminal).sum() /  minibatch_is_not_terminal.count_nonzero()
-            # entro_loss = torch.abs(ent - entropy_clip)
-            # loss += entro_loss_weight * entro_loss 
             logger.debug(f'loss: {loss.item()}')
 
             # Update the policy weights
@@ -367,46 +318,8 @@ def update_policy(model, ref_model, old_model, optimizer, is_terminal, advantang
     if scheduler:
         scheduler.step()
 
-# %% [markdown]
-# ## Putting everything together
 
-# %%
-from peft import LoraConfig, get_peft_model 
-
-model, tokenizer = get_policy_model()
-ref_model, _ = get_policy_model()
-
-config = LoraConfig(
-    r=64, # Rank de las matrices A y B
-    lora_alpha=64, # Factor de regularización de las matrices A y B
-    target_modules= [
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "gate_proj", "up_proj", "down_proj",
-    ],
-    # lora_dropout=0.05, # Dropout de las matrices A y B
-    # bias="none", # No se añade bias a las capas lineales
-    task_type="CAUSAL_LM" # Tipo de tarea
-)
-
-# Use LoRA to finetune the policy and critic model
-model = get_peft_model(model, config)
-
-ref_model.eval()
-
-# %%
-max_steps = 250*8
-sims_per_prompt = 8
-rl_steps = max_steps // sims_per_prompt
-minibatch_size = 8
-update_epochs = 1
-
-model.train()
-
-from torch.optim.lr_scheduler import CosineAnnealingLR
-policy_lr = 5e-6
-kl_penalty_coef = 0.04
-warmup_steps = 25
-optimizer = torch.optim.AdamW(model.parameters(), lr=policy_lr, betas=(0.9, 0.99), weight_decay=0.1)
+# Cosine scheduler with warmup
 from torch.optim.lr_scheduler import CosineAnnealingLR
 class CosineAnnealingWithWarmup:
     def __init__(self, optimizer, warmup_epochs, total_epochs, warmup_start_lr=0.0, eta_min=0):
@@ -431,16 +344,58 @@ class CosineAnnealingWithWarmup:
     
     def get_lr(self):
         return [group['lr'] for group in self.optimizer.param_groups]
+
+# %% [markdown]
+# ## Putting everything together
+
+# %%
+from peft import LoraConfig, get_peft_model 
+
+model, tokenizer = get_policy_model()
+ref_model, _ = get_policy_model()
+
+config = LoraConfig(
+    r=64, # Rank de las matrices A y B
+    lora_alpha=64, # Factor de regularización de las matrices A y B
+    target_modules= [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ],
+    # lora_dropout=0.05, # Dropout de las matrices A y B
+    # bias="none", # No se añade bias a las capas lineales
+    task_type="CAUSAL_LM" # Tipo de tarea
+)
+
+# Use LoRA to finetune the policy model
+model = get_peft_model(model, config)
+
+ref_model.eval()
+
+# %%
+max_steps = 250*8
+sims_per_prompt = 8
+rl_steps = max_steps // sims_per_prompt
+minibatch_size = 8
+update_epochs = 1
+
+model.train()
+
+
+policy_lr = 5e-6
+kl_penalty_coef = 0.04
+warmup_steps = 25
+optimizer = torch.optim.AdamW(model.parameters(), lr=policy_lr, betas=(0.9, 0.99), weight_decay=0.1)
 # scheduler = CosineAnnealingLR(optimizer, T_max=rl_steps)
 scheduler = CosineAnnealingWithWarmup(optimizer, warmup_steps, rl_steps)
 scheduler.step()
 update_ref_model_steps = None
 gae_lambda = 1.0
 normalize_advantage=False
-temperature=0.9 # Temperature for the generations
+temperature=1.0 # Temperature for the generations
 lower_clip=0.8
 upper_clip=1.2
-logger.info(f'Hyperparameters:\nupdate_epochs:{update_epochs}\nrl_steps:{rl_steps}\nsims_per_prompt:{sims_per_prompt}\nminibatch_size:{minibatch_size}\npolicy_lr:{policy_lr}\nwarmup_steps:{warmup_steps}\ngae_lambda: {gae_lambda}\nnormalize advantage:{normalize_advantage}\nlower_clip:{lower_clip}\nupper_clip:{upper_clip}\nkl_penalty_coef:{kl_penalty_coef}\ntemperature:{temperature}')
+dr_grpo = True
+logger.info(f'Hyperparameters:\nupdate_epochs:{update_epochs}\nrl_steps:{rl_steps}\nsims_per_prompt:{sims_per_prompt}\nminibatch_size:{minibatch_size}\npolicy_lr:{policy_lr}\nwarmup_steps:{warmup_steps}\ngae_lambda: {gae_lambda}\nnormalize advantage:{normalize_advantage}\nlower_clip:{lower_clip}\nupper_clip:{upper_clip}\nkl_penalty_coef:{kl_penalty_coef}\ntemperature:{temperature}\ndr_grpo:{dr_grpo}')
 
 
 import copy
@@ -453,18 +408,19 @@ try:
     model.train()
     old_model = None
 
-    for rl_step in range(rl_steps):
+    rl_step = 0
+    while rl_step < rl_steps:
         logger.info(f'rl_step: {rl_step+1:,}')
         generations, rewards, is_terminal, complete_prompts, prompt_length = run_one_mul_simulation(model, sims_per_prompt, temperature=temperature)
-        # if rewards.sum().item() == 0:
-        #     continue
-        advantanges = compute_advantages(rewards, is_terminal, gae_lambda=gae_lambda)
+        advantanges = compute_advantages(rewards, is_terminal, gae_lambda=gae_lambda, dr_grpo=dr_grpo)
+        if (advantanges == 0).all().item():
+            continue
 
         logger.info('Updating policy')
         logger.debug(f'Learning rate: {scheduler.get_lr()}')
-        update_policy(model, ref_model, old_model, optimizer, is_terminal, advantanges, complete_prompts, prompt_length, generations, minibatch_size, update_epochs, scheduler=scheduler, normalize_advantage=normalize_advantage, lower_clip=lower_clip, upper_clip=upper_clip)
+        update_policy(model, ref_model, old_model, optimizer, is_terminal, advantanges, complete_prompts, prompt_length, generations, minibatch_size, update_epochs, scheduler=scheduler, normalize_advantage=normalize_advantage, lower_clip=lower_clip, upper_clip=upper_clip, dr_grpo=dr_grpo)
 
-        # Trach progress on specific task
+        # Track progress on specific task
         if (rl_step+1)%10 == 0:
             model.eval()
             with torch.no_grad():
@@ -474,6 +430,8 @@ try:
 
         if update_ref_model_steps is not None and (rl_step+1)%update_ref_model_steps == 0:
             ref_model = copy.deepcopy(model).eval() # Update the ref model
+
+        rl_step += 1
 
 except KeyboardInterrupt:
     pass
